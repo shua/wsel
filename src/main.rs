@@ -14,9 +14,7 @@ use wayland_protocols::wlr::unstable::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{self as layer_shell, Layer, ZwlrLayerShellV1 as LayerShell},
     zwlr_layer_surface_v1::{self as layer_surface, ZwlrLayerSurfaceV1 as LayerSurface},
 };
-use wayland_protocols::xdg_shell::client::{
-    xdg_wm_base::{self, XdgWmBase},
-};
+use wayland_protocols::xdg_shell::client::xdg_wm_base::{self, XdgWmBase};
 
 macro_rules! filter {
     ($self:ident, $data:ident, $($p:pat => $body:expr),*) => {
@@ -129,12 +127,26 @@ mod font {
         pub height: f32,
     }
 
+    #[cfg(default_font = "static")]
     impl Default for Font {
         fn default() -> Self {
-            let font =
-                rtFont::try_from_bytes(include_bytes!("../default_font.otf") as &[u8])
-                    .expect("Failed constructing a Font from bytes");
+            let font = rtFont::try_from_bytes(include_bytes!(env!("EMBED_FONT")) as &[u8])
+                .expect("Failed to load embedded default font");
             Font::new(font)
+        }
+    }
+
+    #[cfg(default_font = "dynamic")]
+    impl Default for Font {
+        fn default() -> Self {
+            Font::load(env!("DEFAULT_FONT")).unwrap()
+        }
+    }
+
+    #[cfg(default_font = "none")]
+    impl Default for Font {
+        fn default() -> Self {
+            unimplemented!("To use a default font, copy an otf or ttf file into the source directory and recompile")
         }
     }
 
@@ -160,7 +172,7 @@ mod font {
             let glyphs: Vec<_> = self.font.layout(s, self.scale, self.offset).collect();
             let width = glyphs
                 .last()
-                .map(|g| g.position().x as f32 + g.unpositioned().h_metrics().advance_width)
+                .map(|g| g.position().x + g.unpositioned().h_metrics().advance_width)
                 .unwrap_or(0.0);
 
             Glyphs {
