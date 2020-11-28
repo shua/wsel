@@ -3,7 +3,7 @@ use std::cmp::max;
 use std::io::BufRead;
 use wayland_client::protocol::{
     wl_compositor::WlCompositor,
-    wl_pointer,
+    wl_keyboard, wl_pointer,
     wl_seat::{self, WlSeat},
     wl_shm::{self, WlShm},
     wl_surface::WlSurface,
@@ -268,6 +268,12 @@ impl Data {
                 data.ptr.frame = true;
             }
         );
+        let kbd = seat.get_keyboard();
+        filter!(kbd, data,
+            wl_keyboard::Event::Key { key: 1, .. } => {
+                data.cfg.should_close = true;
+            }
+        );
 
         let wmbase = &mut registry.wmbase;
         filter!(wmbase, data,
@@ -311,6 +317,7 @@ impl Data {
         let namespace = String::from("wtmenu");
         let layer = layer_shell.get_layer_surface(&wl.detach(), None, Layer::Overlay, namespace);
         layer.set_size(width as u32, height as u32);
+        layer.set_keyboard_interactivity(1);
         filter!(layer, data,
             layer_surface::Event::Configure { serial, .. } => {
                 data.surface.layer.detach().ack_configure(serial);
