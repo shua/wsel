@@ -574,6 +574,10 @@ fn parse_config(mut args: std::env::Args, stdin: std::io::StdinLock) -> Result<C
     args.next();
     loop {
         match (args.next(), args.next()) {
+            (Some(flag), _) if flag.as_str() == "-h" => {
+                println!("usage: wsel [-h] [-fn font] [-nf color] [-nb color] [-sf color] [-sb color]");
+                std::process::exit(0);
+            }
             (Some(flag), Some(arg)) => match flag.as_str() {
                 "-fn" => {
                     font = font.or(Font::load(&arg)
