@@ -42,7 +42,7 @@ mod conf {
 
     #[derive(Clone, Copy, Debug)]
     pub enum StatusMod {
-        Nul,
+        Esc,
         Bel,
         Enq,
     }
@@ -51,41 +51,40 @@ mod conf {
     pub fn handle_stdin() -> Receiver<Status> {
         fn split_mods(s: &str) -> Vec<(StatusMod, String)> {
             let mut b = 0;
-            let mut e = 1;
             let mut ret = vec![];
-            let mut m = StatusMod::Nul;
-            while b < s.len() {
-                match &s[e-1..e] {
-                    "\x07" /*bell*/ => {
-                        if b != e {
-                            ret.push((m, String::from(&s[b..e-1])));
+            let mut m = StatusMod::Esc;
+            let mut inds = s.char_indices();
+            loop {
+                match inds.next() {
+                    Some((e, c)) => match c {
+                        '\x07' /*bell*/ => {
+                            if b != e {
+                                ret.push((m, String::from(&s[b..e])));
+                            }
+                            m = StatusMod::Bel;
+                            b = e + 1;
+                        },
+                        '\x05' /*enquiry*/ => {
+                            if b != e {
+                                ret.push((m, String::from(&s[b..e])));
+                            }
+                            m = StatusMod::Enq;
+                            b = e + 1;
+                        },
+                        '\x27' /*escape*/ => {
+                            if b != e {
+                                ret.push((m, String::from(&s[b..e])));
+                            }
+                            m = StatusMod::Esc;
+                            b = e + 1;
                         }
-                        m = StatusMod::Bel;
-                        b = e;
-                        e = e + 1;
+                        _ => {}
                     },
-                    "\x05" /*enquiry*/ => {
-                        if b != e {
-                            ret.push((m, String::from(&s[b..e-1])));
+                    None => {
+                        if b < s.len() {
+                            ret.push((m, String::from(&s[b..])));
                         }
-                        m = StatusMod::Enq;
-                        b = e;
-                        e = e + 1;
-                    },
-                    "\x00" /*null*/ => {
-                        if b != e {
-                            ret.push((m, String::from(&s[b..e-1])));
-                        }
-                        m = StatusMod::Nul;
-                        b = e;
-                        e = e + 1;
-                    },
-                    _ if e >= s.len() => {
-                        ret.push((m, String::from(&s[b..])));
-                        b = e;
-                    },
-                    _ => {
-                        e = e + 1;
+                        break;
                     }
                 }
             }
@@ -431,7 +430,7 @@ impl Surface {
                         }
                         cfg.sf
                     }
-                    conf::StatusMod::Nul => cfg.nf,
+                    conf::StatusMod::Esc => cfg.nf,
                 };
                 let (trans_x, trans_y) = (left as i32, 0);
                 left = right;
@@ -726,9 +725,9 @@ fn main() -> Result<()> {
             .context("An error occurred during event dispatch")?;
 
         let wait = if dirty {
-            std::time::Duration::new(0, 10_000_000)
+            std::time::Duration::new(0, 1_000_000)
         } else {
-            std::time::Duration::new(0, 500_000_000)
+            std::time::Duration::new(0, 50_000_000)
         };
         match start.elapsed() {
             Ok(dur) => {
