@@ -3,7 +3,7 @@ use std::env;
 fn main() {
     if let Some(font) = env::var("DEFAULT_FONT").ok() {
         println!("cargo:rustc-cfg=default_font=\"dynamic\"");
-        println!("cargo:rustc-env=DEFAULT_FONT=../{}", font);
+        println!("cargo:rustc-env=DEFAULT_FONT=../../{}", font);
     } else if let Some(font) = std::fs::read_dir(".").ok().and_then(|rd| {
         rd.map(|i| {
             i.ok()
@@ -14,7 +14,7 @@ fn main() {
         .next()
     }) {
         println!("cargo:rustc-cfg=default_font=\"static\"");
-        println!("cargo:rustc-env=EMBED_FONT=../{}", font);
+        println!("cargo:rustc-env=EMBED_FONT=../../{}", font);
     } else {
         println!("cargo:rustc-cfg=default_font=\"none\"");
     }
