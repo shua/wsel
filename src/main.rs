@@ -1,23 +1,26 @@
 use anyhow::{anyhow, Context, Result};
-use std::cmp::max;
-use std::io::BufRead;
 use wayland_client::protocol::{
     wl_compositor::WlCompositor,
-    wl_keyboard, wl_pointer,
+    wl_output::WlOutput,
+    wl_pointer,
     wl_seat::{self, WlSeat},
     wl_shm::{self, WlShm},
     wl_surface::WlSurface,
 };
 use wayland_client::EventQueue;
 use wayland_client::{self, Display, Filter, GlobalManager, Main};
+use wayland_protocols::unstable::xdg_output::v1::client::{
+    zxdg_output_manager_v1::ZxdgOutputManagerV1 as XdgOutputManager,
+    zxdg_output_v1::{self as xdg_output, ZxdgOutputV1 as XdgOutput},
+};
 use wayland_protocols::wlr::unstable::layer_shell::v1::client::{
-    zwlr_layer_shell_v1::{self as layer_shell, Layer, ZwlrLayerShellV1 as LayerShell},
+    zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1 as LayerShell},
     zwlr_layer_surface_v1::{self as layer_surface, ZwlrLayerSurfaceV1 as LayerSurface},
 };
 use wayland_protocols::xdg_shell::client::xdg_wm_base::{self, XdgWmBase};
 
 macro_rules! filter {
-    ($self:ident, $data:ident, $($p:pat => $body:expr),*) => {
+    ($self:expr, $data:ident, $($p:pat => $body:expr),*) => {
         $self.assign(
             Filter::new(move |(_, ev), _filter, mut ddata| {
                 let $data = ddata.get::<Data>().expect("failed to get data");
@@ -33,47 +36,91 @@ macro_rules! filter {
 mod conf {
     use super::Font;
     use anyhow::{anyhow, Result};
+    use std::io::BufRead;
     use std::str::FromStr;
+    use std::sync::mpsc::{self, Receiver};
+
+    #[derive(Clone, Copy, Debug)]
+    pub enum StatusMod {
+        Nul,
+        Bel,
+        Enq,
+    }
+    pub type Status = Vec<Vec<(StatusMod, String)>>;
+
+    pub fn handle_stdin() -> Receiver<Status> {
+        fn split_mods(s: &str) -> Vec<(StatusMod, String)> {
+            let mut b = 0;
+            let mut e = 1;
+            let mut ret = vec![];
+            let mut m = StatusMod::Nul;
+            while b < s.len() {
+                match &s[e-1..e] {
+                    "\x07" /*bell*/ => {
+                        if b != e {
+                            ret.push((m, String::from(&s[b..e-1])));
+                        }
+                        m = StatusMod::Bel;
+                        b = e;
+                        e = e + 1;
+                    },
+                    "\x05" /*enquiry*/ => {
+                        if b != e {
+                            ret.push((m, String::from(&s[b..e-1])));
+                        }
+                        m = StatusMod::Enq;
+                        b = e;
+                        e = e + 1;
+                    },
+                    "\x00" /*null*/ => {
+                        if b != e {
+                            ret.push((m, String::from(&s[b..e-1])));
+                        }
+                        m = StatusMod::Nul;
+                        b = e;
+                        e = e + 1;
+                    },
+                    _ if e >= s.len() => {
+                        ret.push((m, String::from(&s[b..])));
+                        b = e;
+                    },
+                    _ => {
+                        e = e + 1;
+                    }
+                }
+            }
+            ret
+        }
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let stdin = std::io::stdin();
+            let stdin = stdin.lock();
+            for line in stdin.lines() {
+                if let Ok(line) = line {
+                    let status: Status = line.split('\t').map(split_mods).take(3).collect();
+                    tx.send(status).unwrap();
+                }
+            }
+        });
+        rx
+    }
 
     #[derive(Debug, Default)]
     pub struct Config {
         pub font: Font,
-        pub options: Vec<String>,
+        pub status: Status,
         pub nf: u32,
         pub nb: u32,
         pub sf: u32,
         pub sb: u32,
-        pub button_dim: (usize, usize),
+        pub uf: u32,
+        pub ub: u32,
         pub border: usize,
         pub should_close: bool,
     }
 
-    impl Config {
-        pub fn buttons_bounds(&self) -> (usize, usize) {
-            (
-                self.border + self.options.len() * (self.button_dim.0 + self.border),
-                self.border + self.button_dim.1 + self.border,
-            )
-        }
-
-        pub fn in_button(&self, x: usize, y: usize) -> Option<usize> {
-            let (border, (bw, bh)) = (self.border, self.button_dim);
-            if y >= border && y < border + bh && x >= border && (x - border) % (bw + border) < bw {
-                Some((x - border) / (bw + border))
-            } else {
-                None
-            }
-        }
-
-        pub fn button_bounds(&self, i: usize) -> (i32, i32, i32, i32) {
-            let (border, (bw, bh)) = (self.border, self.button_dim);
-            let left = border + i * (bw + border);
-            let right = left + bw;
-            let top = border;
-            let bottom = top + bh;
-            (left as i32, right as i32, top as i32, bottom as i32)
-        }
-    }
+    impl Config {}
 
     #[derive(Debug, Clone, Copy)]
     pub struct Argb(pub u32);
@@ -152,7 +199,7 @@ mod font {
 
     impl Font {
         fn new(font: rtFont<'static>) -> Self {
-            let scale = Scale::uniform(40.0);
+            let scale = Scale::uniform(18.0);
             let v_metrics = font.v_metrics(scale);
             let offset = point(0.0, v_metrics.ascent);
             Font {
@@ -208,6 +255,7 @@ mod font {
 struct Registry {
     compositor: Main<WlCompositor>,
     seat: Main<WlSeat>,
+    xdg_output: Main<XdgOutput>,
     shm: Main<WlShm>,
     wmbase: Main<XdgWmBase>,
     layer_shell: Main<LayerShell>,
@@ -216,9 +264,7 @@ struct Registry {
 #[derive(Debug, Default)]
 struct Pointer {
     pos: Option<(f64, f64)>,
-    pos_prev: Option<(f64, f64)>,
     btn: Option<wl_pointer::ButtonState>,
-    btn_prev: Option<wl_pointer::ButtonState>,
     frame: bool,
 }
 
@@ -226,8 +272,10 @@ struct Pointer {
 struct Surface {
     wl: Main<WlSurface>,
     layer: Main<LayerSurface>,
+    buffer: ShmPixelBuffer,
     committed: bool,
     configured: bool,
+    rendered: bool,
 }
 
 #[derive(Debug)]
@@ -237,19 +285,14 @@ struct Data {
     ptr: Pointer,
     seat_cap: wl_seat::Capability,
     shm_formats: Vec<wl_shm::Format>,
-    buffer: ShmPixelBuffer,
-    surface: Surface,
-    rendered: bool,
+    surface: Option<Surface>,
 }
 
 impl Data {
-    fn new(cfg: Config, mut registry: Registry) -> Data {
-        let seat = &mut registry.seat;
-        filter!(seat, data,
-            wl_seat::Event::Capabilities{capabilities} => data.seat_cap = capabilities
-        );
-        let pointer = seat.get_pointer();
-        filter!(pointer, data,
+    fn new(cfg: Config, registry: Registry) -> Data {
+        filter!(registry.seat, data,
+            wl_seat::Event::Capabilities{capabilities} => data.seat_cap = capabilities);
+        filter!(registry.seat.get_pointer(), data,
             wl_pointer::Event::Enter { surface_x, surface_y, .. } => {
                 data.ptr.pos.replace((surface_x, surface_y));
             },
@@ -268,163 +311,160 @@ impl Data {
                 data.ptr.frame = true;
             }
         );
-        let kbd = seat.get_keyboard();
-        filter!(kbd, data,
-            wl_keyboard::Event::Key { key: 1, .. } => {
-                data.cfg.should_close = true;
-            }
-        );
 
-        let wmbase = &mut registry.wmbase;
-        filter!(wmbase, data,
+        filter!(registry.wmbase, data,
             xdg_wm_base::Event::Ping { serial } => data.registry.wmbase.detach().pong(serial)
         );
-
-        let shm = &mut registry.shm;
-        filter!(shm, data,
+        filter!(registry.xdg_output, data,
+            xdg_output::Event::LogicalSize { width, height } => data.init_surface(width, height)
+        );
+        filter!(registry.shm, data,
             wl_shm::Event::Format { format } => data.shm_formats.push(format)
         );
 
-        let (width, height) = cfg.buttons_bounds();
-        let shmbuffer = create_shmbuffer(width, height, shm).expect("failed to create shm");
-
-        let (width, height) = cfg.buttons_bounds();
-        let surface =
-            Data::create_surface(width, height, &registry.compositor, &registry.layer_shell);
-
-        let mut data = Data {
+        let data = Data {
             cfg,
             registry,
             ptr: Pointer::default(),
-            buffer: shmbuffer,
-            surface: surface,
             seat_cap: wl_seat::Capability::from_raw(0).unwrap(),
             shm_formats: vec![],
-            rendered: false,
+            surface: None,
         };
-        data.render();
         data
     }
 
-    fn create_surface(
-        width: usize,
-        height: usize,
-        compositor: &Main<WlCompositor>,
-        layer_shell: &Main<LayerShell>,
-    ) -> Surface {
-        let wl = compositor.create_surface();
-        let (width, height) = (width as i32, height as i32);
-        let namespace = String::from("wtmenu");
-        let layer = layer_shell.get_layer_surface(&wl.detach(), None, Layer::Overlay, namespace);
-        layer.set_size(width as u32, height as u32);
-        layer.set_keyboard_interactivity(1);
-        filter!(layer, data,
-            layer_surface::Event::Configure { serial, .. } => {
-                data.surface.layer.detach().ack_configure(serial);
-                data.surface.configured = true;
+    fn init_surface(&mut self, width: i32, _height: i32) {
+        let height: i32 = 20;
+        let shmbuffer = create_shmbuffer(width as usize, height as usize, &self.registry.shm)
+            .expect("failed to create shm");
+        let surface = self.registry.compositor.create_surface();
+        let namespace = String::from("wsel");
+        let layer_surface = self.registry.layer_shell.get_layer_surface(
+            &surface.detach(),
+            None,
+            Layer::Overlay,
+            namespace,
+        );
+
+        use layer_surface::Anchor;
+        layer_surface.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
+        layer_surface.set_size(width as u32, height as u32);
+        layer_surface.set_exclusive_zone(height);
+
+        filter!(layer_surface, data,
+            layer_surface::Event::Configure { serial, .. } => if let Some(ref mut surface) = data.surface {
+                surface.layer.detach().ack_configure(serial);
+                surface.configured = true;
             },
             layer_surface::Event::Closed => {
                 data.cfg.should_close = true;
             }
         );
-        wl.commit();
+        surface.commit();
 
-        Surface {
-            wl,
-            layer,
+        let mut surface = Surface {
+            wl: surface,
+            layer: layer_surface,
+            buffer: shmbuffer,
             committed: false,
             configured: false,
-        }
+            rendered: false,
+        };
+        surface.render(&self.cfg);
+        self.surface = Some(surface);
     }
+}
 
-    fn render(&mut self) {
+impl Surface {
+    fn render(&mut self, cfg: &Config) {
         if self.buffer.locked {
             return;
         }
         let shm = &mut self.buffer;
-        let (bw, bh) = self.cfg.button_dim;
-
-        let focus = {
-            let cfg = &self.cfg;
-            (self.ptr.btn)
-                .filter(|s| s == &wl_pointer::ButtonState::Pressed)
-                .and(self.ptr.pos)
-                .and_then(|(x, y)| cfg.in_button(x.ceil() as usize, y.ceil() as usize))
-        };
 
         for i in 0..shm.width {
             for j in 0..shm.height {
-                if let Some(opti) = self.cfg.in_button(i, j) {
-                    shm[(i, j)] = if Some(opti) == focus {
-                        self.cfg.sb
-                    } else {
-                        self.cfg.nb
-                    };
-                } else {
-                    shm[(i, j)] = (self.cfg.nb & 0xffffff) | 0x22000000;
-                }
+                shm[(i, j)] = cfg.nb;
             }
         }
 
-        let scale = |v: u8, s: u8| ((v as u32 * s as u32) / 255) as u8;
-        let (nf, sf) = (self.cfg.nf, self.cfg.sf);
-        let rendered = self.rendered;
-        for i in 0..self.cfg.options.len() {
-            let opt = self.cfg.options.get(i).unwrap();
-            let g = self.cfg.font.glyphs(opt);
-
-            let (left, right, top, bottom) = self.cfg.button_bounds(i);
-
-            let trans_x: i32 = max(left, left - (g.width.ceil() as i32 - bw as i32) / 2);
-            let trans_y: i32 = max(top, top - (g.height.ceil() as i32 - bh as i32) / 2);
-
-            let (mut warn_btn, mut warn_buf) = (false, false);
-            g.render(|x, y, v| {
-                let (x, y) = (x as i32 + trans_x, y as i32 + trans_y);
-                if x < 0 || x as usize >= shm.width || y < 0 || y as usize >= shm.height {
-                    if !rendered && !warn_buf {
-                        eprintln!(
-                            "glyph for {:?} exceeds buffer boundaries: {:?} {:?}",
-                            opt,
-                            (x, y),
-                            (shm.width, shm.height)
-                        );
-                        warn_buf = true;
-                    }
-                    return;
-                }
-                if x < left || x >= right || y < top || y >= bottom {
-                    if !rendered && !warn_btn {
-                        eprintln!(
-                            "glyph for {:?} exceeds button boundaries: {:?} {:?}",
-                            opt,
-                            (x, y),
-                            (left, right, top, bottom)
-                        );
-                        warn_btn = true;
-                    }
-                    return;
-                }
-
-                let pixi = (x as usize, y as usize);
-                let [a, rb, gb, bb] = shm[pixi].to_be_bytes();
-                let [_, rf, gf, bf] = if Some(i) == focus {
-                    sf.to_be_bytes()
-                } else {
-                    nf.to_be_bytes()
-                };
-                shm[pixi] = u32::from_be_bytes([
-                    a,
-                    max(rb, scale(v, rf)),
-                    max(gb, scale(v, gf)),
-                    max(bb, scale(v, bf)),
-                ]);
-            });
+        fn scale(v: u8, s: u8) -> u8 {
+            ((v as u32 * s as u32) / 255) as u8
+        }
+        fn lerp(s: u8, a: u8, b: u8) -> u8 {
+            scale(s, a) + scale(255 - s, b)
         }
 
-        let (ww, wh) = self.cfg.buttons_bounds();
-        self.surface.wl.damage(0, 0, ww as i32, wh as i32);
-        self.surface.committed = false;
+        let rendered = self.rendered;
+        let mut alignments = ["left", "center", "right"].into_iter();
+        for col in cfg.status.iter() {
+            let align = alignments.next().unwrap();
+            let gsegs = col
+                .iter()
+                .map(|(m, seg)| (*m, cfg.font.glyphs(seg)))
+                .collect::<Vec<_>>();
+            let width = gsegs.iter().fold(0.0, |acc, (_, g)| acc + g.width);
+            let mut left = match align {
+                "left" => 0,
+                "center" => (shm.width - width.ceil() as usize) / 2,
+                "right" => shm.width - width.ceil() as usize,
+                _ => unreachable!(),
+            };
+
+            for (m, g) in gsegs.into_iter() {
+                let mut warn_buf = false;
+                let right = left + g.width.ceil() as usize;
+                let fg = match m {
+                    conf::StatusMod::Bel => {
+                        for x in left..right {
+                            for y in 0..shm.height {
+                                shm[(x, y)] = cfg.ub;
+                            }
+                        }
+                        cfg.uf
+                    }
+                    conf::StatusMod::Enq => {
+                        for x in left..right {
+                            for y in 0..shm.height {
+                                shm[(x, y)] = cfg.sb;
+                            }
+                        }
+                        cfg.sf
+                    }
+                    conf::StatusMod::Nul => cfg.nf,
+                };
+                let (trans_x, trans_y) = (left as i32, 0);
+                left = right;
+                g.render(|x, y, v| {
+                    let (x, y) = (x as i32 + trans_x, y as i32 + trans_y);
+                    if x < 0 || x as usize >= shm.width || y < 0 || y as usize >= shm.height {
+                        if !rendered && !warn_buf {
+                            eprintln!(
+                                "glyph exceeds buffer boundaries: {:?} {:?}",
+                                (x, y),
+                                (shm.width, shm.height)
+                            );
+                            warn_buf = true;
+                        }
+                        return;
+                    }
+
+                    let pixi = (x as usize, y as usize);
+                    let [ab, rb, gb, bb] = shm[pixi].to_be_bytes();
+                    let [af, rf, gf, bf] = fg.to_be_bytes();
+                    let s = scale(af, v);
+                    shm[pixi] = u32::from_be_bytes([
+                        lerp(s, 0xff, ab),
+                        lerp(s, rf, rb),
+                        lerp(s, gf, gb),
+                        lerp(s, bf, bb),
+                    ]);
+                });
+            }
+        }
+
+        self.wl.damage(0, 0, shm.width as i32, shm.height as i32);
+        self.committed = false;
         self.rendered = true;
     }
 }
@@ -519,7 +559,9 @@ mod pixbuf {
 
         filter!(buffer, data,
             wl_buffer::Event::Release => {
-                data.buffer.locked = false;
+                if let Some(ref mut surface) = data.surface {
+                    surface.buffer.locked = false;
+                }
             }
         );
 
@@ -527,8 +569,8 @@ mod pixbuf {
             wl: buffer,
             locked: false,
             addr: shmdata,
-            width: width,
-            height: height,
+            width,
+            height,
         })
     }
 }
@@ -545,6 +587,13 @@ fn init_registry(display: &Display, event_queue: &mut EventQueue) -> Result<Regi
     let seat: Main<WlSeat> = gm
         .instantiate_exact(5)
         .context("Failed to get seat handle")?;
+    let output: Main<WlOutput> = gm
+        .instantiate_exact(4)
+        .context("Failed to get output handle")?;
+    let output_manager: Main<XdgOutputManager> = gm
+        .instantiate_exact(3)
+        .context("Failed to get xdg output manager handle")?;
+    let xdg_output = output_manager.get_xdg_output(&output);
     let wmbase: Main<XdgWmBase> = gm
         .instantiate_exact(2)
         .context("Failed to get wmbase handle")?;
@@ -558,24 +607,32 @@ fn init_registry(display: &Display, event_queue: &mut EventQueue) -> Result<Regi
     Ok(Registry {
         compositor,
         seat,
+        xdg_output,
         wmbase,
         shm,
         layer_shell,
     })
 }
 
-fn parse_config(mut args: std::env::Args, stdin: std::io::StdinLock) -> Result<Config> {
+fn parse_config(mut args: std::env::Args) -> Result<Config> {
     let border = 1usize;
-    let (bw, bh) = (300usize, 0usize);
-    let (mut nf, mut nb, mut sf, mut sb) =
-        (0xffddddddu32, 0xdd222222u32, 0xffddddddu32, 0xffff9900u32);
+    let (mut nf, mut nb, mut sf, mut sb, mut uf, mut ub) = (
+        0xffddddddu32,
+        0xdd222222u32,
+        0xff222222u32,
+        0xffff9900u32,
+        0xff222222u32,
+        0xffddddddu32,
+    );
     let mut font: Option<Font> = None;
 
     args.next();
     loop {
         match (args.next(), args.next()) {
             (Some(flag), _) if flag.as_str() == "-h" => {
-                println!("usage: wsel [-h] [-fn font] [-nf color] [-nb color] [-sf color] [-sb color]");
+                println!(
+                    "usage: wsel [-h] [-fn font] [-nf color] [-nb color] [-sf color] [-sb color]"
+                );
                 std::process::exit(0);
             }
             (Some(flag), Some(arg)) => match flag.as_str() {
@@ -588,6 +645,8 @@ fn parse_config(mut args: std::env::Args, stdin: std::io::StdinLock) -> Result<C
                 "-nb" => nb = arg.parse::<Argb>()?.0,
                 "-sf" => sf = arg.parse::<Argb>()?.0,
                 "-sb" => sb = arg.parse::<Argb>()?.0,
+                "-uf" => uf = arg.parse::<Argb>()?.0,
+                "-ub" => ub = arg.parse::<Argb>()?.0,
                 _ => {
                     Err(anyhow!("Unrecognized argument {}", flag))?;
                 }
@@ -597,70 +656,90 @@ fn parse_config(mut args: std::env::Args, stdin: std::io::StdinLock) -> Result<C
         }
     }
 
-    let options = stdin.lines().fold(Ok(vec![]), |acc, x| match (acc, x) {
-        (Ok(acc), Ok(s)) if s.len() == 0 => Ok(acc),
-        (Ok(mut acc), Ok(s)) => Ok({
-            acc.push(s);
-            acc
-        }),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-    })?;
-
     Ok(Config {
-        options,
+        status: vec![],
         font: font.unwrap_or_else(Font::default),
-        button_dim: (bw, if bh != 0 { bh } else { bw }),
         border,
         nf,
         nb,
         sf,
         sb,
+        uf,
+        ub,
         should_close: false,
     })
 }
 
 fn main() -> Result<()> {
-    let cfg = parse_config(std::env::args(), std::io::stdin().lock())?;
-    if cfg.options.len() == 0 {
-        return Ok(());
-    }
+    let cfg = parse_config(std::env::args())?;
 
     let display = Display::connect_to_env().context("failed to connect to display")?;
     let mut event_queue = display.create_event_queue();
     let registry = init_registry(&display, &mut event_queue)
         .context("failed to get necessary handles for registry")?;
     let mut data = Data::new(cfg, registry);
+    let status_ch = conf::handle_stdin();
 
+    let mut dirty = true;
     while !data.cfg.should_close {
-        event_queue
-            .dispatch(&mut data, |_, _, _| {})
-            .context("An error occurred during event dispatch")?;
+        let start = std::time::SystemTime::now();
 
-        if data.ptr.frame
-            && (data.ptr.pos_prev.is_some() ^ data.ptr.pos.is_some()
-                || data.ptr.btn != data.ptr.btn_prev)
-        {
-            data.ptr.btn_prev = data.ptr.btn;
-            data.ptr.pos_prev = data.ptr.pos;
-            data.render();
+        while let Ok(status) = status_ch.try_recv() {
+            data.cfg.status = status;
+            data.surface.as_mut().map(|s| s.rendered = false);
+            dirty = true;
+        }
 
-            if let Some(opt) = (data.ptr.btn)
-                .filter(|btn| btn == &wl_pointer::ButtonState::Released)
-                .and(data.ptr.pos)
-                .and_then(|(x, y)| data.cfg.in_button(x.ceil() as usize, y.ceil() as usize))
-                .and_then(|i| data.cfg.options.get(i))
-            {
-                println!("{}", opt);
-                data.cfg.should_close = true;
+        if let Some(ref mut surface) = data.surface {
+            if surface.rendered != true {
+                surface.render(&data.cfg);
+            }
+
+            if surface.configured && !surface.committed {
+                surface.wl.attach(Some(&surface.buffer.wl), 0, 0);
+                surface.buffer.locked = true;
+                surface.wl.commit();
+                surface.committed = true;
+            }
+
+            if surface.committed {
+                dirty = false;
             }
         }
 
-        if data.surface.configured && !data.surface.committed {
-            data.surface.wl.attach(Some(&data.buffer.wl), 0, 0);
-            data.buffer.locked = true;
-            data.surface.wl.commit();
-            data.surface.committed = true;
+        if let Err(e) = display.flush() {
+            if e.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(e.into());
+            }
+        }
+
+        if let Some(guard) = event_queue.prepare_read() {
+            if let Err(e) = guard.read_events() {
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        event_queue
+            .dispatch_pending(&mut data, |_, _, _| {})
+            .context("An error occurred during event dispatch")?;
+
+        let wait = if dirty {
+            std::time::Duration::new(0, 10_000_000)
+        } else {
+            std::time::Duration::new(0, 500_000_000)
+        };
+        match start.elapsed() {
+            Ok(dur) => {
+                if dur < wait {
+                    std::thread::sleep(wait - dur);
+                }
+            }
+            Err(e) => {
+                eprintln!("sleep: {}", e);
+                std::thread::sleep(std::time::Duration::new(1, 0));
+            }
         }
     }
 
