@@ -55,31 +55,21 @@ mod conf {
             let mut m = StatusMod::Esc;
             let mut inds = s.char_indices();
             loop {
-                match inds.next() {
-                    Some((e, c)) => match c {
-                        '\x07' /*bell*/ => {
-                            if b != e {
-                                ret.push((m, String::from(&s[b..e])));
-                            }
-                            m = StatusMod::Bel;
-                            b = e + 1;
-                        },
-                        '\x05' /*enquiry*/ => {
-                            if b != e {
-                                ret.push((m, String::from(&s[b..e])));
-                            }
-                            m = StatusMod::Enq;
-                            b = e + 1;
-                        },
-                        '\x27' /*escape*/ => {
-                            if b != e {
-                                ret.push((m, String::from(&s[b..e])));
-                            }
-                            m = StatusMod::Esc;
-                            b = e + 1;
+                let mod_next = inds.next().map(|(e, c)| match c {
+                    '\x07' /*bell*/ => Some((e, StatusMod::Bel)),
+                    '\x05' /*enquiry*/ => Some((e, StatusMod::Enq)),
+                    '\x1b' /*escape*/ => Some((e, StatusMod::Esc)),
+                    _ => None,
+                });
+                match mod_next {
+                    Some(Some((e, m2))) => {
+                        if b != e {
+                            ret.push((m, String::from(&s[b..e])));
                         }
-                        _ => {}
-                    },
+                        m = m2;
+                        b = e + 1;
+                    }
+                    Some(None) => {}
                     None => {
                         if b < s.len() {
                             ret.push((m, String::from(&s[b..])));
@@ -115,7 +105,7 @@ mod conf {
         pub sb: u32,
         pub uf: u32,
         pub ub: u32,
-        pub border: usize,
+        pub height: usize,
         pub should_close: bool,
     }
 
@@ -315,7 +305,7 @@ impl Data {
             xdg_wm_base::Event::Ping { serial } => data.registry.wmbase.detach().pong(serial)
         );
         filter!(registry.xdg_output, data,
-            xdg_output::Event::LogicalSize { width, height } => data.init_surface(width, height)
+            xdg_output::Event::LogicalSize { width, .. } => data.init_surface(width, data.cfg.height as i32)
         );
         filter!(registry.shm, data,
             wl_shm::Event::Format { format } => data.shm_formats.push(format)
@@ -332,8 +322,7 @@ impl Data {
         data
     }
 
-    fn init_surface(&mut self, width: i32, _height: i32) {
-        let height: i32 = 20;
+    fn init_surface(&mut self, width: i32, height: i32) {
         let shmbuffer = create_shmbuffer(width as usize, height as usize, &self.registry.shm)
             .expect("failed to create shm");
         let surface = self.registry.compositor.create_surface();
@@ -341,7 +330,7 @@ impl Data {
         let layer_surface = self.registry.layer_shell.get_layer_surface(
             &surface.detach(),
             None,
-            Layer::Overlay,
+            Layer::Bottom,
             namespace,
         );
 
@@ -614,7 +603,7 @@ fn init_registry(display: &Display, event_queue: &mut EventQueue) -> Result<Regi
 }
 
 fn parse_config(mut args: std::env::Args) -> Result<Config> {
-    let border = 1usize;
+    let height = 20usize;
     let (mut nf, mut nb, mut sf, mut sb, mut uf, mut ub) = (
         0xffddddddu32,
         0xdd222222u32,
@@ -658,7 +647,7 @@ fn parse_config(mut args: std::env::Args) -> Result<Config> {
     Ok(Config {
         status: vec![],
         font: font.unwrap_or_else(Font::default),
-        border,
+        height,
         nf,
         nb,
         sf,

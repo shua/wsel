@@ -287,8 +287,6 @@ impl Data {
 
         let (width, height) = cfg.buttons_bounds();
         let shmbuffer = create_shmbuffer(width, height, shm).expect("failed to create shm");
-
-        let (width, height) = cfg.buttons_bounds();
         let surface =
             Data::create_surface(width, height, &registry.compositor, &registry.layer_shell);
 
@@ -313,8 +311,7 @@ impl Data {
         layer_shell: &Main<LayerShell>,
     ) -> Surface {
         let wl = compositor.create_surface();
-        let (width, height) = (width as i32, height as i32);
-        let namespace = String::from("wtmenu");
+        let namespace = String::from("wsel");
         let layer = layer_shell.get_layer_surface(&wl.detach(), None, Layer::Overlay, namespace);
         layer.set_size(width as u32, height as u32);
         layer.set_keyboard_interactivity(layer_surface::KeyboardInteractivity::Exclusive);
