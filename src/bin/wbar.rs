@@ -1,5 +1,12 @@
+use std::io::BufRead;
+use std::str::FromStr;
+use std::sync::mpsc::{self, Receiver};
+
 use anyhow::{anyhow, Context, Result};
+use rusttype::{self, point, Font as rtFont, Point, PositionedGlyph, Scale};
+
 use wayland_client::protocol::{
+    wl_buffer::{self, WlBuffer},
     wl_compositor::WlCompositor,
     wl_output::WlOutput,
     wl_pointer,
@@ -33,210 +40,187 @@ macro_rules! filter {
     };
 }
 
-mod conf {
-    use super::Font;
-    use anyhow::{anyhow, Result};
-    use std::io::BufRead;
-    use std::str::FromStr;
-    use std::sync::mpsc::{self, Receiver};
+#[derive(Debug)]
+pub struct Font {
+    font: rtFont<'static>,
+    scale: Scale,
+    offset: Point<f32>,
+}
 
-    #[derive(Clone, Copy, Debug)]
-    pub enum StatusMod {
-        Esc,
-        Bel,
-        Enq,
+#[derive(Debug)]
+pub struct Glyphs<'f> {
+    glyphs: Vec<PositionedGlyph<'f>>,
+    pub width: f32,
+    pub height: f32,
+}
+
+#[cfg(default_font = "static")]
+impl Default for Font {
+    fn default() -> Self {
+        let font = rtFont::try_from_bytes(include_bytes!(env!("EMBED_FONT")) as &[u8])
+            .expect("Failed to load embedded default font");
+        Font::new(font)
     }
-    pub type Status = Vec<Vec<(StatusMod, String)>>;
+}
 
-    pub fn handle_stdin() -> Receiver<Status> {
-        fn split_mods(s: &str) -> Vec<(StatusMod, String)> {
-            let mut b = 0;
-            let mut ret = vec![];
-            let mut m = StatusMod::Esc;
-            let mut inds = s.char_indices();
-            loop {
-                let mod_next = inds.next().map(|(e, c)| match c {
+#[cfg(default_font = "dynamic")]
+impl Default for Font {
+    fn default() -> Self {
+        Font::load(env!("DEFAULT_FONT")).context("load font from DEFAULT_FONT env")
+    }
+}
+
+#[cfg(default_font = "none")]
+impl Default for Font {
+    fn default() -> Self {
+        unimplemented!("To use a default font, copy an otf or ttf file into the source directory and recompile")
+    }
+}
+
+impl Font {
+    fn new(font: rtFont<'static>) -> Self {
+        let scale = Scale::uniform(18.0);
+        let v_metrics = font.v_metrics(scale);
+        let offset = point(0.0, v_metrics.ascent);
+        Font {
+            font,
+            scale,
+            offset,
+        }
+    }
+
+    pub fn load<P: AsRef<std::path::Path>>(name: &P) -> Result<Font> {
+        let bytes = std::fs::read(name)?;
+        let font = rtFont::try_from_vec(bytes).context("Failed loading the default font")?;
+        Ok(Self::new(font))
+    }
+
+    pub fn glyphs(&self, s: &str) -> Glyphs {
+        let glyphs: Vec<_> = self.font.layout(s, self.scale, self.offset).collect();
+        let width = glyphs
+            .last()
+            .map(|g| g.position().x + g.unpositioned().h_metrics().advance_width)
+            .unwrap_or(0.0);
+
+        Glyphs {
+            glyphs,
+            width,
+            height: self.scale.y,
+        }
+    }
+}
+
+impl<'f> Glyphs<'f> {
+    pub fn render(self, mut d: impl FnMut(usize, usize, u8)) {
+        let (width, height) = (self.width.ceil(), self.height.ceil());
+
+        self.glyphs
+            .iter()
+            .filter_map(|g| g.pixel_bounding_box().map(|bb| (g, bb)))
+            .for_each(|(g, bb)| {
+                g.draw(|x, y, v| {
+                    let v = (v * 255.0).ceil() as u8;
+                    let x = x as i32 + bb.min.x;
+                    let y = y as i32 + bb.min.y;
+                    if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
+                        d(x as usize, y as usize, v);
+                    }
+                })
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum StatusMod {
+    Esc,
+    Bel,
+    Enq,
+}
+pub type Status = Vec<Vec<(StatusMod, String)>>;
+
+pub fn handle_stdin() -> Receiver<Status> {
+    fn split_mods(s: &str) -> Vec<(StatusMod, String)> {
+        let mut b = 0;
+        let mut ret = vec![];
+        let mut m = StatusMod::Esc;
+        let mut inds = s.char_indices();
+        loop {
+            let mod_next = inds.next().map(|(e, c)| match c {
                     '\x07' /*bell*/ => Some((e, StatusMod::Bel)),
                     '\x05' /*enquiry*/ => Some((e, StatusMod::Enq)),
                     '\x1b' /*escape*/ => Some((e, StatusMod::Esc)),
                     _ => None,
                 });
-                match mod_next {
-                    Some(Some((e, m2))) => {
-                        if b != e {
-                            ret.push((m, String::from(&s[b..e])));
-                        }
-                        m = m2;
-                        b = e + 1;
+            match mod_next {
+                Some(Some((e, m2))) => {
+                    if b != e {
+                        ret.push((m, String::from(&s[b..e])));
                     }
-                    Some(None) => {}
-                    None => {
-                        if b < s.len() {
-                            ret.push((m, String::from(&s[b..])));
-                        }
-                        break;
+                    m = m2;
+                    b = e + 1;
+                }
+                Some(None) => {}
+                None => {
+                    if b < s.len() {
+                        ret.push((m, String::from(&s[b..])));
                     }
+                    break;
                 }
             }
-            ret
         }
-
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let stdin = std::io::stdin();
-            let stdin = stdin.lock();
-            for line in stdin.lines() {
-                if let Ok(line) = line {
-                    let status: Status = line.split('\t').map(split_mods).take(3).collect();
-                    tx.send(status).unwrap();
-                }
-            }
-        });
-        rx
+        ret
     }
 
-    #[derive(Debug, Default)]
-    pub struct Config {
-        pub font: Font,
-        pub status: Status,
-        pub nf: u32,
-        pub nb: u32,
-        pub sf: u32,
-        pub sb: u32,
-        pub uf: u32,
-        pub ub: u32,
-        pub height: usize,
-        pub should_close: bool,
-    }
-
-    impl Config {}
-
-    #[derive(Debug, Clone, Copy)]
-    pub struct Argb(pub u32);
-
-    static ARGB_FORMAT_MSG: &str =
-        "Argb must be specified by a '#' followed by exactly 3, 4, 6, or 8 digits";
-
-    impl FromStr for Argb {
-        type Err = anyhow::Error;
-        fn from_str(s: &str) -> Result<Self> {
-            if !s.starts_with('#') || !s[1..].chars().all(|c| c.is_ascii_hexdigit()) {
-                return Err(anyhow!(ARGB_FORMAT_MSG));
-            }
-
-            let s = &s[1..];
-            let dup = |s: &str| {
-                s.chars().fold(String::new(), |mut s, c| {
-                    s.push(c);
-                    s.push(c);
-                    s
-                })
-            };
-            match s.len() {
-                8 => Ok(Argb(u32::from_str_radix(s, 16)?)),
-                6 => Ok(Argb(u32::from_str_radix(s, 16)? | 0xff000000)),
-                4 => Ok(Argb(u32::from_str_radix(&dup(s), 16)?)),
-                3 => Ok(Argb(u32::from_str_radix(&dup(s), 16)? | 0xff000000)),
-                _ => Err(anyhow!(ARGB_FORMAT_MSG)),
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let stdin = stdin.lock();
+        for line in stdin.lines() {
+            if let Ok(line) = line {
+                let status: Status = line.split('\t').map(split_mods).take(3).collect();
+                tx.send(status).unwrap();
             }
         }
-    }
+    });
+    rx
 }
-use conf::{Argb, Config};
 
-use font::Font;
-mod font {
-    use anyhow::{Context, Result};
-    use rusttype::{self, point, Font as rtFont, Point, PositionedGlyph, Scale};
+#[derive(Debug, Default)]
+pub struct Config {
+    pub font: Font,
+    pub status: Status,
+    pub nf: u32,
+    pub nb: u32,
+    pub sf: u32,
+    pub sb: u32,
+    pub uf: u32,
+    pub ub: u32,
+    pub height: usize,
+    pub should_close: bool,
+}
 
-    #[derive(Debug)]
-    pub struct Font {
-        font: rtFont<'static>,
-        scale: Scale,
-        offset: Point<f32>,
+const ARGB_FORMAT_MSG: &str =
+    "Argb must be specified by a '#' followed by exactly 3, 4, 6, or 8 digits";
+
+fn parse_argb(s: &str) -> Result<u32> {
+    if !s.starts_with('#') || !s[1..].chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!(ARGB_FORMAT_MSG));
     }
 
-    #[derive(Debug)]
-    pub struct Glyphs<'f> {
-        glyphs: Vec<PositionedGlyph<'f>>,
-        pub width: f32,
-        pub height: f32,
+    let s = &s[1..];
+    fn dup(s: &str) -> String {
+        s.chars().fold(String::new(), |mut s, c| {
+            s.push(c);
+            s.push(c);
+            s
+        })
     }
-
-    #[cfg(default_font = "static")]
-    impl Default for Font {
-        fn default() -> Self {
-            let font = rtFont::try_from_bytes(include_bytes!(env!("EMBED_FONT")) as &[u8])
-                .expect("Failed to load embedded default font");
-            Font::new(font)
-        }
-    }
-
-    #[cfg(default_font = "dynamic")]
-    impl Default for Font {
-        fn default() -> Self {
-            Font::load(env!("DEFAULT_FONT")).unwrap()
-        }
-    }
-
-    #[cfg(default_font = "none")]
-    impl Default for Font {
-        fn default() -> Self {
-            unimplemented!("To use a default font, copy an otf or ttf file into the source directory and recompile")
-        }
-    }
-
-    impl Font {
-        fn new(font: rtFont<'static>) -> Self {
-            let scale = Scale::uniform(18.0);
-            let v_metrics = font.v_metrics(scale);
-            let offset = point(0.0, v_metrics.ascent);
-            Font {
-                font,
-                scale,
-                offset,
-            }
-        }
-
-        pub fn load<P: AsRef<std::path::Path>>(name: &P) -> Result<Font> {
-            let bytes = std::fs::read(name)?;
-            let font = rtFont::try_from_vec(bytes).context("Failed loading the default font")?;
-            Ok(Self::new(font))
-        }
-
-        pub fn glyphs(&self, s: &str) -> Glyphs {
-            let glyphs: Vec<_> = self.font.layout(s, self.scale, self.offset).collect();
-            let width = glyphs
-                .last()
-                .map(|g| g.position().x + g.unpositioned().h_metrics().advance_width)
-                .unwrap_or(0.0);
-
-            Glyphs {
-                glyphs,
-                width,
-                height: self.scale.y,
-            }
-        }
-    }
-
-    impl<'f> Glyphs<'f> {
-        pub fn render(self, mut d: impl FnMut(usize, usize, u8)) {
-            let (width, height) = (self.width.ceil(), self.height.ceil());
-
-            self.glyphs
-                .iter()
-                .filter_map(|g| g.pixel_bounding_box().map(|bb| (g, bb)))
-                .for_each(|(g, bb)| {
-                    g.draw(|x, y, v| {
-                        let v = (v * 255.0).ceil() as u8;
-                        let x = x as i32 + bb.min.x;
-                        let y = y as i32 + bb.min.y;
-                        if x >= 0 && x < width as i32 && y >= 0 && y < height as i32 {
-                            d(x as usize, y as usize, v);
-                        }
-                    })
-                })
-        }
+    match s.len() {
+        8 => Ok(u32::from_str_radix(s, 16)?),
+        6 => Ok(u32::from_str_radix(s, 16)? | 0xff000000),
+        4 => Ok(u32::from_str_radix(&dup(s), 16)?),
+        3 => Ok(u32::from_str_radix(&dup(s), 16)? | 0xff000000),
+        _ => Err(anyhow!(ARGB_FORMAT_MSG)),
     }
 }
 
@@ -315,7 +299,7 @@ impl Data {
             cfg,
             registry,
             ptr: Pointer::default(),
-            seat_cap: wl_seat::Capability::from_raw(0).unwrap(),
+            seat_cap: wl_seat::Capability::from_raw(0).expect("construct empty wl_seat capability"),
             shm_formats: vec![],
             surface: None,
         };
@@ -376,51 +360,36 @@ impl Surface {
             }
         }
 
-        fn scale(v: u8, s: u8) -> u8 {
-            ((v as u32 * s as u32) / 255) as u8
-        }
-        fn lerp(s: u8, a: u8, b: u8) -> u8 {
-            scale(s, a) + scale(255 - s, b)
-        }
-
         let rendered = self.rendered;
-        let mut alignments = ["left", "center", "right"].into_iter();
-        for col in cfg.status.iter() {
-            let align = alignments.next().unwrap();
+        for (i, col) in cfg.status.iter().enumerate() {
             let gsegs = col
                 .iter()
                 .map(|(m, seg)| (*m, cfg.font.glyphs(seg)))
                 .collect::<Vec<_>>();
-            let width = gsegs.iter().fold(0.0, |acc, (_, g)| acc + g.width);
-            let mut left = match align {
-                "left" => 0,
-                "center" => (shm.width - width.ceil() as usize) / 2,
-                "right" => shm.width - width.ceil() as usize,
+            let width: f32 = gsegs.iter().map(|(_, g)| g.width).sum();
+            let width = shm.width - width.ceil() as usize;
+            let mut left = match i {
+                0 => 0,         // align left
+                1 => width / 2, // align center
+                2 => width,     // align right
                 _ => unreachable!(),
             };
 
             for (m, g) in gsegs.into_iter() {
                 let mut warn_buf = false;
                 let right = left + g.width.ceil() as usize;
-                let fg = match m {
-                    conf::StatusMod::Bel => {
-                        for x in left..right {
-                            for y in 0..shm.height {
-                                shm[(x, y)] = cfg.ub;
-                            }
-                        }
-                        cfg.uf
-                    }
-                    conf::StatusMod::Enq => {
-                        for x in left..right {
-                            for y in 0..shm.height {
-                                shm[(x, y)] = cfg.sb;
-                            }
-                        }
-                        cfg.sf
-                    }
-                    conf::StatusMod::Esc => cfg.nf,
+                let (fg, bg) = match m {
+                    StatusMod::Bel => (cfg.uf, cfg.ub),
+                    StatusMod::Enq => (cfg.sf, cfg.sb),
+                    StatusMod::Esc => (cfg.nf, cfg.nb),
                 };
+                if bg != cfg.nb {
+                    for x in left..right {
+                        for y in 0..shm.height {
+                            shm[(x, y)] = cfg.ub;
+                        }
+                    }
+                }
                 let (trans_x, trans_y) = (left as i32, 0);
                 left = right;
                 g.render(|x, y, v| {
@@ -437,10 +406,17 @@ impl Surface {
                         return;
                     }
 
-                    let pixi = (x as usize, y as usize);
-                    let [ab, rb, gb, bb] = shm[pixi].to_be_bytes();
+                    fn scale(v: u8, s: u8) -> u8 {
+                        ((v as u32 * s as u32) / 255) as u8
+                    }
+                    fn lerp(s: u8, a: u8, b: u8) -> u8 {
+                        scale(s, a) + scale(255 - s, b)
+                    }
+
+                    let [ab, rb, gb, bb] = bg.to_be_bytes();
                     let [af, rf, gf, bf] = fg.to_be_bytes();
                     let s = scale(af, v);
+                    let pixi = (x as usize, y as usize);
                     shm[pixi] = u32::from_be_bytes([
                         lerp(s, 0xff, ab),
                         lerp(s, rf, rb),
@@ -457,112 +433,97 @@ impl Surface {
     }
 }
 
-mod pixbuf {
-    use super::Data;
-    use anyhow::{Context, Result};
-    use wayland_client::protocol::{
-        wl_buffer::{self, WlBuffer},
-        wl_shm::{self, WlShm},
-    };
-    use wayland_client::{Filter, Main};
+#[derive(Debug)]
+pub struct ShmPixelBuffer {
+    pub wl: Main<WlBuffer>,
+    pub locked: bool,
+    pub width: usize,
+    pub height: usize,
+    addr: *mut u32,
+}
 
-    #[derive(Debug)]
-    pub struct ShmPixelBuffer {
-        pub wl: Main<WlBuffer>,
-        pub locked: bool,
-        pub width: usize,
-        pub height: usize,
-        addr: *mut u32,
-    }
-
-    impl std::ops::Index<(usize, usize)> for ShmPixelBuffer {
-        type Output = u32;
-        fn index(&self, (x, y): (usize, usize)) -> &Self::Output {
-            if x >= self.width || y >= self.height {
-                panic!(
-                    "index ({}, {}) out of bounds (0..{}, 0..{})",
-                    x, y, self.width, self.height
-                );
-            }
-            unsafe {
-                self.addr
-                    .offset((x + y * self.width) as isize)
-                    .as_ref()
-                    .unwrap()
-            }
-        }
-    }
-
-    impl std::ops::IndexMut<(usize, usize)> for ShmPixelBuffer {
-        fn index_mut(&mut self, (x, y): (usize, usize)) -> &mut Self::Output {
-            if x >= self.width || y >= self.height {
-                panic!(
-                    "index ({}, {}) out of bounds (0..{}, 0..{})",
-                    x, y, self.width, self.height
-                );
-            }
-            unsafe {
-                self.addr
-                    .offset((x + y * self.width) as isize)
-                    .as_mut()
-                    .unwrap()
-            }
-        }
-    }
-
-    pub fn create_shmbuffer(
-        width: usize,
-        height: usize,
-        shm: &Main<WlShm>,
-    ) -> Result<ShmPixelBuffer> {
-        let fd = nix::unistd::mkstemp("/dev/shm/shmbuf_XXXXXX")
-            .and_then(|(fd, path)| nix::unistd::unlink(path.as_path()).and(Ok(fd)))
-            .context("Failed to create temp file fd for shm")?;
-        let (format, pixel_size) = (wl_shm::Format::Argb8888, 4);
-        let stride: i32 = width as i32 * pixel_size;
-        let size: usize = stride as usize * height;
-
-        nix::unistd::ftruncate(fd, size as i64).context("Failed calling ftruncate")?;
-
-        let shmdata: *mut u32 = unsafe {
-            let data = libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
+impl std::ops::Index<(usize, usize)> for ShmPixelBuffer {
+    type Output = u32;
+    fn index(&self, (x, y): (usize, usize)) -> &Self::Output {
+        if x >= self.width || y >= self.height {
+            panic!(
+                "index ({}, {}) out of bounds (0..{}, 0..{})",
+                x, y, self.width, self.height
             );
-            // checking for null is not in the manpage example, can you mmap 0x0?
-            if data == libc::MAP_FAILED || data.is_null() {
-                libc::close(fd);
-                panic!("map failed");
-            }
-            data as *mut u32
-        };
-
-        let pool = shm.create_pool(fd, size as i32);
-        let buffer = pool.create_buffer(0, width as i32, height as i32, stride, format);
-        pool.destroy();
-
-        filter!(buffer, data,
-            wl_buffer::Event::Release => {
-                if let Some(ref mut surface) = data.surface {
-                    surface.buffer.locked = false;
-                }
-            }
-        );
-
-        Ok(ShmPixelBuffer {
-            wl: buffer,
-            locked: false,
-            addr: shmdata,
-            width,
-            height,
-        })
+        }
+        unsafe {
+            self.addr
+                .offset((x + y * self.width) as isize)
+                .as_ref()
+                .expect("checked index of raw shm addr")
+        }
     }
 }
-use pixbuf::{create_shmbuffer, ShmPixelBuffer};
+
+impl std::ops::IndexMut<(usize, usize)> for ShmPixelBuffer {
+    fn index_mut(&mut self, (x, y): (usize, usize)) -> &mut Self::Output {
+        if x >= self.width || y >= self.height {
+            panic!(
+                "index ({}, {}) out of bounds (0..{}, 0..{})",
+                x, y, self.width, self.height
+            );
+        }
+        unsafe {
+            self.addr
+                .offset((x + y * self.width) as isize)
+                .as_mut()
+                .expect("checked index of raw shm addr")
+        }
+    }
+}
+
+pub fn create_shmbuffer(width: usize, height: usize, shm: &Main<WlShm>) -> Result<ShmPixelBuffer> {
+    let fd = nix::unistd::mkstemp("/dev/shm/shmbuf_XXXXXX")
+        .and_then(|(fd, path)| nix::unistd::unlink(path.as_path()).and(Ok(fd)))
+        .context("Failed to create temp file fd for shm")?;
+    let (format, pixel_size) = (wl_shm::Format::Argb8888, 4);
+    let stride: i32 = width as i32 * pixel_size;
+    let size: usize = stride as usize * height;
+
+    nix::unistd::ftruncate(fd, size as i64).context("Failed calling ftruncate")?;
+
+    let shmdata: *mut u32 = unsafe {
+        let data = libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        );
+        // checking for null is not in the manpage example, can you mmap 0x0?
+        if data == libc::MAP_FAILED || data.is_null() {
+            libc::close(fd);
+            panic!("map failed");
+        }
+        data as *mut u32
+    };
+
+    let pool = shm.create_pool(fd, size as i32);
+    let buffer = pool.create_buffer(0, width as i32, height as i32, stride, format);
+    pool.destroy();
+
+    filter!(buffer, data,
+        wl_buffer::Event::Release => {
+            if let Some(ref mut surface) = data.surface {
+                surface.buffer.locked = false;
+            }
+        }
+    );
+
+    Ok(ShmPixelBuffer {
+        wl: buffer,
+        locked: false,
+        addr: shmdata,
+        width,
+        height,
+    })
+}
 
 fn init_registry(display: &Display, event_queue: &mut EventQueue) -> Result<Registry> {
     let disp_proxy = display.attach(event_queue.token());
@@ -629,12 +590,12 @@ fn parse_config(mut args: std::env::Args) -> Result<Config> {
                         .map_err(|err| eprintln!("failed to load font {}: {}", arg, err))
                         .ok())
                 }
-                "-nf" => nf = arg.parse::<Argb>()?.0,
-                "-nb" => nb = arg.parse::<Argb>()?.0,
-                "-sf" => sf = arg.parse::<Argb>()?.0,
-                "-sb" => sb = arg.parse::<Argb>()?.0,
-                "-uf" => uf = arg.parse::<Argb>()?.0,
-                "-ub" => ub = arg.parse::<Argb>()?.0,
+                "-nf" => nf = parse_argb(&arg)?,
+                "-nb" => nb = parse_argb(&arg)?,
+                "-sf" => sf = parse_argb(&arg)?,
+                "-sb" => sb = parse_argb(&arg)?,
+                "-uf" => uf = parse_argb(&arg)?,
+                "-ub" => ub = parse_argb(&arg)?,
                 _ => {
                     Err(anyhow!("Unrecognized argument {}", flag))?;
                 }
@@ -666,7 +627,7 @@ fn main() -> Result<()> {
     let registry = init_registry(&display, &mut event_queue)
         .context("failed to get necessary handles for registry")?;
     let mut data = Data::new(cfg, registry);
-    let status_ch = conf::handle_stdin();
+    let status_ch = handle_stdin();
 
     let mut dirty = true;
     while !data.cfg.should_close {
